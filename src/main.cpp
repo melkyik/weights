@@ -4,14 +4,14 @@
 #include <ModbusIP_ESP8266.h>
 //#include <SoftwareSerial.h>
 //SoftwareSerial S(13, 15);
-#define LEN 2
+
 const char* ssid = "Laba"; // Указываем имя существующей точки доступа
 const char* password = "iFarmiFarm"; // Указываем пароль существующей точки доступа
 
 ESP8266WebServer server(80);
 ModbusIP mb;
-IPAddress srcIp; //адрес источника
-#define  DEBUG
+#define LEN 2 //регистров в модбасе
+//#define  DEBUG
 #ifdef DEBUG
 uint16_t cbRead(TRegister* reg, uint16_t val) {
   Serial.print("Read. Reg RAW#: ");
@@ -22,8 +22,6 @@ uint16_t cbRead(TRegister* reg, uint16_t val) {
   Serial.println(val);
   return val;
 }
-
-// Callback function to write-protect DI
 uint16_t cbWrite(TRegister* reg, uint16_t val) {
   Serial.print("Write. Reg RAW#: ");
   Serial.print(reg->address.address);
@@ -33,13 +31,15 @@ uint16_t cbWrite(TRegister* reg, uint16_t val) {
   Serial.println(val);
   return val;
 }
-#endif
+
 
 
 bool cbConn(IPAddress ip) {
   Serial.println(ip);
   return true;
 }
+#endif
+
 
 uint8_t counter;
 ulong lasttick;
@@ -72,6 +72,9 @@ void handleNotFound() { // Обрабатываем небезызвестную
   }
   server.send(404, "text/plain", message);
 }
+
+
+
 //#################################################3
 void setup(void) {
   Serial.begin(115200);
@@ -91,7 +94,10 @@ void setup(void) {
   Serial.print("IP адрес: ");
   Serial.println(WiFi.localIP());
 
+#ifdef DEBUG
   mb.onConnect(cbConn); 
+#endif
+
   mb.server();
 
   if (!mb.addHreg(0, 0xF0F0, LEN)) Serial.println("Error"); // Add Hregs
