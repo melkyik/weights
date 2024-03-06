@@ -4,9 +4,8 @@
 #include <ModbusIP_ESP8266.h>
 //#include <SoftwareSerial.h>
 //SoftwareSerial S(13, 15);
-
-const char* ssid = "Laba"; // Указываем имя существующей точки доступа
-const char* password = "iFarmiFarm"; // Указываем пароль существующей точки доступа
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#define TRIGGER_PIN D5
 
 ESP8266WebServer server(80);
 ModbusIP mb;
@@ -78,9 +77,9 @@ void handleNotFound() { // Обрабатываем небезызвестную
 //#################################################3
 void setup(void) {
   Serial.begin(115200);
-
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
   WiFi.mode(WIFI_STA); // Устанавливаем Wi-Fi модуль в режим клиента (STA)
-  WiFi.begin(ssid, password); // Устанавливаем ssid и пароль от сети, подключаемся
+  WiFi.begin(); // Устанавливаем ssid и пароль от сети, подключаемся
   
   while (WiFi.status() != WL_CONNECTED) { // Ожидаем подключения к Wi-Fi
     delay(500);
@@ -90,7 +89,7 @@ void setup(void) {
   // Выводим информацию о подключении
   Serial.println("");
   Serial.print("Подключено к ");
-  Serial.println(ssid);
+  Serial.println( WiFi.SSID()); // Устанавливаем ssid и пароль от сети, подключаем;
   Serial.print("IP адрес: ");
   Serial.println(WiFi.localIP());
 
@@ -123,6 +122,24 @@ void setup(void) {
 }
 
 void loop(void) {
+
+  //
+    if ( digitalRead(TRIGGER_PIN) == LOW) {
+    WiFiManager wm;    
+    //reset settings - for testing
+    //wm.resetSettings();
+      // set configportal timeout
+    wm.setConfigPortalTimeout(120);
+
+    if (!wm.startConfigPortal("")) {
+      Serial.println("failed to connect and hit timeout");
+      delay(3000);
+      ESP.restart();
+      delay(5000);
+    }
+    Serial.println("connected...yeey :)");
+    }
+    //
   server.handleClient();
   if (millis() - lasttick >TICK_TIME ) {
         counter++; 
