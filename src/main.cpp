@@ -2,14 +2,35 @@
 #include <DNSServer.h>
 #include <Arduino.h>
 #include <ModbusIP_ESP8266.h>
-//#include <SoftwareSerial.h>
-//SoftwareSerial S(13, 15);
-#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
-#define TRIGGER_PIN D5
+#include <SoftwareSerial.h>
 
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#define TRIGGER_PIN D7 //пин сброса вайфай 
+#define SERIAL_BUFER_SIZE 40
+//протокол весов
+#define WSOH 1         //заголовок ответа
+#define WSTX 2         //начало текста
+#define WSTA 0x53      //константа стабильного веса
+#define WUSTA 0x55     //константа неытабильного веса
+
+#define WEOT 4         //конец текста
+#define WETX 3         //конец ответа
 ESP8266WebServer server(80);
+SoftwareSerial S(D2, D1);
+uint8_t scomand[2] = {0x05,0x11}; //комада запроса
+
+
+char sbuffer[SERIAL_BUFER_SIZE];//строка ответа от порта
+bool weightstable;
+char weightstr[10];
+float weightval;
+uint16_t* mbWeight = reinterpret_cast<uint16_t*>(&weightval);
+uint8_t c;
+
+uint8_t bufLen; //длина буфера полученых данных 
+uint8_t ind;
 ModbusIP mb;
-#define LEN 2 //регистров в модбасе
+#define MBLEN 8 //регистров в модбасе
 //#define  DEBUG
 #ifdef DEBUG
 uint16_t cbRead(TRegister* reg, uint16_t val) {
@@ -42,7 +63,9 @@ bool cbConn(IPAddress ip) {
 
 uint8_t counter;
 ulong lasttick;
-#define TICK_TIME 1000
+ulong lastCharTime = 0;
+
+#define TICK_TIME 500
 
 void handleRoot() { // Обработчик запроса клиента по корневому адресу
   #define BUFFER_SIZE     1000
@@ -54,7 +77,7 @@ snprintf(temp, BUFFER_SIZE-1,
 "f();setInterval(f,1e2);</script></body></html>"
 );
   server.send(200, F("text/html; charset=utf-8"), temp);
-}
+} 
 
 
 void handleNotFound() { // Обрабатываем небезызвестную ошибку 404
@@ -77,7 +100,9 @@ void handleNotFound() { // Обрабатываем небезызвестную
 //#################################################3
 void setup(void) {
   Serial.begin(115200);
-  pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  S.begin(9600);
+
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);//режим сброса вайфай
   WiFi.mode(WIFI_STA); // Устанавливаем Wi-Fi модуль в режим клиента (STA)
   WiFi.begin(); // Устанавливаем ssid и пароль от сети, подключаемся
   
@@ -99,7 +124,7 @@ void setup(void) {
 
   mb.server();
 
-  if (!mb.addHreg(0, 0xF0F0, LEN)) Serial.println("Error"); // Add Hregs
+  if (!mb.addHreg(0, 0xF0F0, MBLEN)) Serial.println("Error"); // пишем HREGS
   #ifdef DEBUG
   mb.onGetHreg(0, cbRead, LEN); // Add callback on Coils value get
   mb.onSetHreg(0, cbWrite, LEN);
@@ -110,7 +135,7 @@ void setup(void) {
 
   server.on("/weight", []() {
 
-  server.send(200, F("text/plain"), String(counter)+"kg"); 
+  server.send(200, F("text/plain"), String(weightstr)); 
 
   });
 
@@ -122,8 +147,7 @@ void setup(void) {
 }
 
 void loop(void) {
-
-  //
+//обработчик сброса вайфай 
     if ( digitalRead(TRIGGER_PIN) == LOW) {
     WiFiManager wm;    
     //reset settings - for testing
@@ -139,13 +163,65 @@ void loop(void) {
     }
     Serial.println("connected...yeey :)");
     }
-    //
+    //конец обработчика сброса
   server.handleClient();
   if (millis() - lasttick >TICK_TIME ) {
         counter++; 
-        mb.Hreg(1,counter);
-        lasttick=millis();}
- 
+        ///передача регистров
+        mb.Hreg(0,counter);
+        mb.Hreg(1,mbWeight[1]);
+        mb.Hreg(2,mbWeight[0]);
+        mb.Hreg(3,weightstable);
+        mb.Hreg(4,trunc(weightval*100));
+        ////////////////
+        lasttick=millis();
+      
+        S.write(scomand,2);
+      //  Serial.println("send CMD..");
+              }
+
+  
+    for(int i=0;i<SERIAL_BUFER_SIZE-1;i++ )  sbuffer[i]=0;
+
+   // unsigned long lastCharTime = 0;
+    ind = 0;
+    if (S.available() > 0) {          
+                      sbuffer[ind++] = S.read();    
+                      lastCharTime = millis();           
+                      while ((S.available() > 0) ||  ((millis() - lastCharTime) < 200) && (ind < SERIAL_BUFER_SIZE-1)) {
+                          if (S.available() > 0) {
+                              sbuffer[ind++] = S.read();
+                              lastCharTime = millis();             // timer restart
+                          }
+                      }
+                      bufLen=ind;
+      
+
+               for(int i=0; (i<SERIAL_BUFER_SIZE) && (sbuffer[i]!=0) ;i++){
+                              Serial.print(sbuffer[i],HEX);
+                              Serial.print(" ");
+                              }
+
+              if ((sbuffer[0]==0x06) && (bufLen>=16)){
+                      weightstable=sbuffer[3]==WSTA;
+                      c=4;
+                      ind=0;
+                        while((sbuffer[c]!=3) && (sbuffer[c]!=0)){
+                        if (sbuffer[c]!=0x20) weightstr[ind++]=sbuffer[c]; //пропускаем пробелы
+                        c++;
+                      }
+               weightstr[ind-1]=0;
+               Serial.println();
+               Serial.println(weightstr);
+               weightval=atof(weightstr);
+            
+              // Serial.println(weightstr[strlen(weightstr)-1],DEC);
+                Serial.println(weightval);
+             }
+                Serial.println();
+     }
+
      mb.task();
-     delay(10);
+    delay(5);
 }
+   
