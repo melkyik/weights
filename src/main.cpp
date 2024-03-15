@@ -3,35 +3,57 @@
 #include <Arduino.h>
 #include <ModbusIP_ESP8266.h>
 #include <SoftwareSerial.h>
-
 #include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
-#define TRIGGER_PIN D7 //пин сброса вайфай 
+
+/*
+Программа запускает опрос весов HD-150 по Softwareserial на пинах D1 D2
+К пинам подключен TTL-232 преобразователь  на микросхеме MAX3232 
+Опрос весов идет по упрощеному протоколу CAS AD посылкой команды 05 11 
+В ответе помимо системных регистров приходит значение веса в строковом виде в кодировке ASCII
+
+Дополнительно 
+подключен менеджер WIfi (библиотекой WiFiManager.h) для настройки и сохранения в память данных о wifi подключении
+Для перехода в режим настройки нужно замкнуть землю на D7
+подключен Modbus Slave <ModbusIP_ESP8266.h>  где в регистрах 01 02 функции F03 выдается значение веса Float32
+в регистре 03 - флаг стабильного веса, в регистре 04 - вес*100 в масштабированом значении INT16
+
+Реализован веб сервер библиотекой   "ESP8266WebServerSecure.h" который выдает строку с весом по запросу /weight 
+и в конрневом доступе выдает страницу c текущим весом и обновлением 200мс через Javascript 
+
+*/
+#define TRIGGER_PIN D7 //пин сброса вайфай и перехода в режим точки доступа с настройкой WiFi подключения
 #define SERIAL_BUFER_SIZE 40
+
 //протокол весов
-#define WSOH 1         //заголовок ответа
-#define WSTX 2         //начало текста
-#define WSTA 0x53      //константа стабильного веса
-#define WUSTA 0x55     //константа неытабильного веса
+#define WSOH 1                           //заголовок ответа
+#define WSTX 2                           //начало текста
+#define WSTA 0x53                        //константа стабильного веса
+#define WUSTA 0x55                       //константа нестабильного веса
+#define WEOT 4                            //конец текста
+#define WETX 3                           //конец ответа
+//___________________________________________________
 
-#define WEOT 4         //конец текста
-#define WETX 3         //конец ответа
-ESP8266WebServer server(80);
-SoftwareSerial S(D2, D1);
-uint8_t scomand[2] = {0x05,0x11}; //комада запроса
+ESP8266WebServer server(80);          //обьявление веб сервера
+SoftwareSerial S(D2, D1);             //порт Serial на пинах 
+ModbusIP mb;                          //экземпляр модбас
 
 
-char sbuffer[SERIAL_BUFER_SIZE];//строка ответа от порта
-bool weightstable;
-char weightstr[10];
-float weightval;
-uint16_t* mbWeight = reinterpret_cast<uint16_t*>(&weightval);
+uint8_t scomand[2] = {0x05,0x11};     //комада запроса по протоколу весов
+
+
+char sbuffer[SERIAL_BUFER_SIZE];      //строка ответа от порта
+bool weightstable;                    //стабильный вес флаг
+char weightstr[10];                   //строка для веса
+float weightval;                      //вес float
+uint16_t* mbWeight = reinterpret_cast<uint16_t*>(&weightval); //указатель на weightval но на выходе - массив uint16_t[2] для передачи в модбас
+
+//вспомогательные переменные
 uint8_t c;
-
-uint8_t bufLen; //длина буфера полученых данных 
+uint8_t bufLen;           //длина буфера полученых данных 
 uint8_t ind;
-ModbusIP mb;
-#define MBLEN 8 //регистров в модбасе
-//#define  DEBUG
+
+#define MBLEN 8            //регистров в модбасе
+//#define  DEBUG           //ОТЛАДКА MODBUS
 #ifdef DEBUG
 uint16_t cbRead(TRegister* reg, uint16_t val) {
   Serial.print("Read. Reg RAW#: ");
@@ -60,15 +82,19 @@ bool cbConn(IPAddress ip) {
 }
 #endif
 
+//буферные переменные
+uint8_t counter;        //пульс
+ulong lasttick;         //таймер тиков команд 
+ulong lastCharTime = 0; //таймаут опроса порта
 
-uint8_t counter;
-ulong lasttick;
-ulong lastCharTime = 0;
+#define TICK_TIME 500   //время посылки команды в весы
 
-#define TICK_TIME 500
 
-void handleRoot() { // Обработчик запроса клиента по корневому адресу
-  #define BUFFER_SIZE     1000
+//#################################################
+//WEB SERVER HANDLERS
+
+void handleRoot() {           // Обработчик запроса клиента по корневому адресу, настройка интерфейса
+#define BUFFER_SIZE     1000 //c запасом пока 
   char temp[BUFFER_SIZE];
 snprintf(temp, BUFFER_SIZE-1,
 "<html><head><style>.c{display:flex;justify-content:center;align-items:center;height:100vh;}"\
@@ -80,7 +106,7 @@ snprintf(temp, BUFFER_SIZE-1,
 } 
 
 
-void handleNotFound() { // Обрабатываем небезызвестную ошибку 404
+void handleNotFound() { // Обрабатываем  ошибку 404
   String message = "Not Found\n\n";
   message += "URI: ";
   message += server.uri();
@@ -95,9 +121,10 @@ void handleNotFound() { // Обрабатываем небезызвестную
   server.send(404, "text/plain", message);
 }
 
-
-
 //#################################################3
+
+
+
 void setup(void) {
   Serial.begin(115200);
   S.begin(9600);
@@ -129,7 +156,7 @@ void setup(void) {
   mb.onGetHreg(0, cbRead, LEN); // Add callback on Coils value get
   mb.onSetHreg(0, cbWrite, LEN);
   #endif
-  // Устанавливаем обработчики. Можно сделать двумя способами:
+  // Устанавливаем обработчики веб. Можно сделать двумя способами:
 
   server.on("/", handleRoot);
 
@@ -188,6 +215,7 @@ void loop(void) {
     if (S.available() > 0) {          
                       sbuffer[ind++] = S.read();    
                       lastCharTime = millis();           
+                      //реализация таймаута ответа от порта 200мс
                       while ((S.available() > 0) ||  ((millis() - lastCharTime) < 200) && (ind < SERIAL_BUFER_SIZE-1)) {
                           if (S.available() > 0) {
                               sbuffer[ind++] = S.read();
@@ -196,12 +224,12 @@ void loop(void) {
                       }
                       bufLen=ind;
       
-
+                //вывод строки ответа в HEX
                for(int i=0; (i<SERIAL_BUFER_SIZE) && (sbuffer[i]!=0) ;i++){
                               Serial.print(sbuffer[i],HEX);
                               Serial.print(" ");
                               }
-
+             //парсинг строки ответа от весов но только при длинном ответе
               if ((sbuffer[0]==0x06) && (bufLen>=16)){
                       weightstable=sbuffer[3]==WSTA;
                       c=4;
