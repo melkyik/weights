@@ -13,7 +13,7 @@
 
 Дополнительно 
 подключен менеджер WIfi (библиотекой WiFiManager.h) для настройки и сохранения в память данных о wifi подключении
-Для перехода в режим настройки нужно замкнуть землю на D7
+Портал настройки открывается при старте на 3 минуты, если подключиться к сохраненной сети не удалось
 подключен Modbus Slave <ModbusIP_ESP8266.h>  где в регистрах 01 02 функции F03 выдается значение веса Float32
 в регистре 03 - флаг стабильного веса, в регистре 04 - вес*100 в масштабированом значении INT16
 
@@ -21,7 +21,8 @@
 и в конрневом доступе выдает страницу c текущим весом и обновлением 200мс через Javascript 
 
 */
-#define TRIGGER_PIN D7 //пин сброса вайфай и перехода в режим точки доступа с настройкой WiFi подключения
+#define PORTAL_TIMEOUT_SEC 180 //время работы портала настройки при старте, сек
+const char* AP_NAME = "WeightAP"; //имя точки доступа портала настройки
 #define SERIAL_BUFER_SIZE 40
 
 //протокол весов
@@ -84,8 +85,9 @@ bool cbConn(IPAddress ip) {
 
 //буферные переменные
 uint8_t counter;        //пульс
-ulong lasttick;         //таймер тиков команд 
+ulong lasttick;         //таймер тиков команд
 ulong lastCharTime = 0; //таймаут опроса порта
+bool cmdPending = false; //команда отправлена и ожидается ответ
 
 #define TICK_TIME 500   //время посылки команды в весы
 
@@ -124,26 +126,36 @@ void handleNotFound() { // Обрабатываем  ошибку 404
 //#################################################3
 
 
-
 void setup(void) {
   Serial.begin(115200);
   S.begin(9600);
 
-  pinMode(TRIGGER_PIN, INPUT_PULLUP);//режим сброса вайфай
-  WiFi.mode(WIFI_STA); // Устанавливаем Wi-Fi модуль в режим клиента (STA)
-  WiFi.begin(); // Устанавливаем ssid и пароль от сети, подключаемся
-  
-  while (WiFi.status() != WL_CONNECTED) { // Ожидаем подключения к Wi-Fi
-    delay(500);
-    Serial.print(".");
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); //LED выкл (активный LOW)
+
+  //портал настройки открывается при старте на PORTAL_TIMEOUT_SEC, затем работаем без сети
+  WiFiManager wm;
+  //reset settings - for testing
+  //wm.resetSettings(); //стирание сохраненных настроек - намеренно не вызывается
+  wm.setConfigPortalTimeout(PORTAL_TIMEOUT_SEC);
+  wm.setAPCallback([](WiFiManager* w) {
+    digitalWrite(LED_BUILTIN, LOW); //LED горит пока портал активен
+    Serial.print("AP режим, SSID: ");
+    Serial.println(WiFi.softAPSSID());
+  });
+
+  if (wm.autoConnect(AP_NAME)) {
+    // Выводим информацию о подключении
+    Serial.println("");
+    Serial.print("Подключено к ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP адрес: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("");
+    Serial.println("Портал настройки закрыт - продолжаем без сети");
   }
-  
-  // Выводим информацию о подключении
-  Serial.println("");
-  Serial.print("Подключено к ");
-  Serial.println( WiFi.SSID()); // Устанавливаем ssid и пароль от сети, подключаем;
-  Serial.print("IP адрес: ");
-  Serial.println(WiFi.localIP());
+  digitalWrite(LED_BUILTIN, HIGH); //LED выкл после портала
 
 #ifdef DEBUG
   mb.onConnect(cbConn); 
@@ -174,23 +186,6 @@ void setup(void) {
 }
 
 void loop(void) {
-//обработчик сброса вайфай 
-    if ( digitalRead(TRIGGER_PIN) == LOW) {
-    WiFiManager wm;    
-    //reset settings - for testing
-    //wm.resetSettings();
-      // set configportal timeout
-    wm.setConfigPortalTimeout(120);
-
-    if (!wm.startConfigPortal("")) {
-      Serial.println("failed to connect and hit timeout");
-      delay(3000);
-      ESP.restart();
-      delay(5000);
-    }
-    Serial.println("connected...yeey :)");
-    }
-    //конец обработчика сброса
   server.handleClient();
   if (millis() - lasttick >TICK_TIME ) {
         counter++; 
@@ -202,9 +197,13 @@ void loop(void) {
         mb.Hreg(4,trunc(weightval*100));
         ////////////////
         lasttick=millis();
-      
+
+        //вывод отправленной команды в HEX
+        Serial.print("TX: ");
+        for (uint8_t i = 0; i < sizeof(scomand); i++) Serial.printf("%02X ", scomand[i]);
+        Serial.println();
+        cmdPending = true;
         S.write(scomand,2);
-      //  Serial.println("send CMD..");
               }
 
   
@@ -223,12 +222,15 @@ void loop(void) {
                           }
                       }
                       bufLen=ind;
-      
-                //вывод строки ответа в HEX
-               for(int i=0; (i<SERIAL_BUFER_SIZE) && (sbuffer[i]!=0) ;i++){
-                              Serial.print(sbuffer[i],HEX);
-                              Serial.print(" ");
-                              }
+                      cmdPending = false;
+
+                //вывод ответа весов в HEX с длиной пакета
+                Serial.print("RX (");
+                Serial.print(bufLen);
+                Serial.print(" байт): ");
+                for (int i = 0; i < bufLen; i++) Serial.printf("%02X ", sbuffer[i]);
+                Serial.println();
+
              //парсинг строки ответа от весов но только при длинном ответе
               if ((sbuffer[0]==0x06) && (bufLen>=16)){
                       weightstable=sbuffer[3]==WSTA;
@@ -238,16 +240,24 @@ void loop(void) {
                         if (sbuffer[c]!=0x20) weightstr[ind++]=sbuffer[c]; //пропускаем пробелы
                         c++;
                       }
-               weightstr[ind-1]=0;
-               Serial.println();
-               Serial.println(weightstr);
+               if (ind>0) weightstr[ind-1]=0; else weightstr[0]=0;
                weightval=atof(weightstr);
-            
-              // Serial.println(weightstr[strlen(weightstr)-1],DEC);
-                Serial.println(weightval);
+               Serial.print("Вес: ");
+               Serial.print(weightstr);
+               Serial.print(" -> ");
+               Serial.print(weightval);
+               Serial.print(" | стабильный: ");
+               Serial.println(weightstable ? "да" : "нет");
+             } else {
+               Serial.println("Ответ не соответствует протоколу весов (ожидался пакет 06 ... 03 длиной >=16)");
              }
-                Serial.println();
      }
+
+    //диагностика отсутствия ответа
+    if (cmdPending && (millis() - lasttick > 400)) {
+      Serial.println("RX: нет ответа от весов");
+      cmdPending = false;
+    }
 
      mb.task();
     delay(5);
